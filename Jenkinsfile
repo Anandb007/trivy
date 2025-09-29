@@ -2,11 +2,7 @@ pipeline {
     agent any
 
     environment {
-        IMAGE_NAME = "my-nginx"
-        DOCKERFILE_JSON = "dockerfile_scan.json"
-        DOCKERFILE_CSV = "dockerfile_scan.csv"
-        IMAGE_JSON = "trivy_report.json"
-        IMAGE_CSV = "trivy_report.csv"
+        VULN_THRESHOLD = 80
     }
 
     stages {
@@ -16,54 +12,48 @@ pipeline {
             }
         }
 
-        stage('Build Docker Image') {
+        stage('Scan Multiple Dockerfiles') {
             steps {
                 script {
-                    sh "docker build -t ${IMAGE_NAME}:latest ."
-                }
-            }
-        }
+                    // List of Dockerfiles and corresponding image names
+                    def dockerfiles = [
+                        ['file': 'Dockerfile.clean', 'image': 'my-nginx-clean'],
+                        ['file': 'Dockerfile.misconfig', 'image': 'my-nginx-misconfig'],
+                        ['file': 'Dockerfile.vuln', 'image': 'my-nginx-vuln']
+                    ]
 
-        stage('Trivy Scan Dockerfile') {
-            steps {
-                script {
-                    sh """
-                    # Scan Dockerfile in JSON
-                    trivy config --severity HIGH,MEDIUM,LOW --format json -o ${DOCKERFILE_JSON} .
+                    dockerfiles.each { df ->
+                        echo "Building and scanning ${df.file}..."
+                        sh "docker build -f ${df.file} -t ${df.image}:latest ."
 
-                    # Convert JSON → CSV using jq
-                    jq -r '
-                      .Results[].Misconfigurations[] | [
-                        .ID,
-                        .Type,
-                        .Message,
-                        .Severity,
-                        .Resolution,
-                        (.References // [] | join("; "))
-                      ] | @csv' ${DOCKERFILE_JSON} > ${DOCKERFILE_CSV}
-                    """
-                }
-            }
-        }
+                        // Dockerfile config scan
+                        sh """
+                        trivy config --severity HIGH,MEDIUM,LOW --format json -o ${df.image}_dockerfile.json -f ${df.file}
+                        jq -r '.Results[].Misconfigurations[] | [.ID,.Type,.Message,.Severity,.Resolution,(.References//[] | join("; "))] | @csv' ${df.image}_dockerfile.json > ${df.image}_dockerfile.csv
+                        """
 
-        stage('Trivy Scan Docker Image') {
-            steps {
-                script {
-                    sh """
-                    # Scan Docker image in JSON
-                    trivy image --format json -o ${IMAGE_JSON} ${IMAGE_NAME}:latest
+                        // Docker image scan
+                        sh """
+                        trivy image --severity HIGH,MEDIUM,LOW --format json -o ${df.image}_image.json ${df.image}:latest
+                        jq -r '.Results[].Vulnerabilities[] | [.VulnerabilityID,.PkgName,.InstalledVersion,.FixedVersion,.Severity,.Title] | @csv' ${df.image}_image.json > ${df.image}_image.csv
+                        """
 
-                    # Convert JSON → CSV using jq
-                    jq -r '
-                      .Results[].Vulnerabilities[] | [
-                        .VulnerabilityID,
-                        .PkgName,
-                        .InstalledVersion,
-                        .FixedVersion,
-                        .Severity,
-                        .Title
-                      ] | @csv' ${IMAGE_JSON} > ${IMAGE_CSV}
-                    """
+                        // Calculate total vulnerabilities
+                        def dockerfileVuln = sh(script: "jq '.Results[].Misconfigurations | length' ${df.image}_dockerfile.json | awk '{s+=\$1} END {print s}'", returnStdout: true).trim()
+                        def imageVuln = sh(script: "jq '.Results[].Vulnerabilities | length' ${df.image}_image.json | awk '{s+=\$1} END {print s}'", returnStdout: true).trim()
+                        def totalVulns = dockerfileVuln.toInteger() + imageVuln.toInteger()
+
+                        echo "Total vulnerabilities for ${df.image}: ${totalVulns}"
+
+                        if (totalVulns > VULN_THRESHOLD.toInteger()) {
+                            error "Build failed! Vulnerabilities exceed threshold for ${df.image}."
+                        } else {
+                            echo "Scan passed for ${df.image}."
+                        }
+
+                        // Clean up Docker image after scan
+                        sh "docker rmi ${df.image}:latest || true"
+                    }
                 }
             }
         }
@@ -77,8 +67,8 @@ pipeline {
 
     post {
         always {
-            echo "Cleaning up Docker image..."
-            sh "docker rmi ${IMAGE_NAME}:latest || true"
+            echo "Cleaning up temporary files..."
+            sh "rm -f *.json *.csv"
         }
     }
 }
