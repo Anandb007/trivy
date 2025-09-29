@@ -35,9 +35,7 @@ pipeline {
             steps {
                 script {
                     sh """
-                    trivy image --format template --template \
-                    '@@/usr/local/share/trivy/templates/csv.tpl' \
-                    -o ${REPORT_FILE} ${IMAGE_NAME}:latest
+                    trivy image --format csv -o ${REPORT_FILE} ${IMAGE_NAME}:latest
                     """
                 }
             }
