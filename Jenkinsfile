@@ -57,13 +57,6 @@ pipeline {
                 archiveArtifacts artifacts: '*.txt, *.csv', fingerprint: true
             }
         }
-    }
-
-    post {
-        always {
-            echo "Cleaning up Docker image..."
-            sh "docker rmi ${IMAGE_NAME}:latest || true"
-        }
-    }
+     }
 }
 
