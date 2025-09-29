@@ -3,8 +3,10 @@ pipeline {
 
     environment {
         IMAGE_NAME = "my-nginx"
-        REPORT_JSON = "trivy_report.json"
-        REPORT_CSV = "trivy_report.csv"
+        DOCKERFILE_JSON = "dockerfile_scan.json"
+        DOCKERFILE_CSV = "dockerfile_scan.csv"
+        IMAGE_JSON = "trivy_report.json"
+        IMAGE_CSV = "trivy_report.csv"
     }
 
     stages {
@@ -26,8 +28,19 @@ pipeline {
             steps {
                 script {
                     sh """
-                    # Scan Dockerfile for misconfigurations
-                    trivy config --severity HIGH,MEDIUM,LOW . > dockerfile_scan.txt
+                    # Scan Dockerfile in JSON
+                    trivy config --severity HIGH,MEDIUM,LOW --format json -o ${DOCKERFILE_JSON} .
+
+                    # Convert JSON → CSV using jq
+                    jq -r '
+                      .Results[].Misconfigurations[] | [
+                        .ID,
+                        .Type,
+                        .Message,
+                        .Severity,
+                        .Resolution,
+                        (.References // [] | join("; "))
+                      ] | @csv' ${DOCKERFILE_JSON} > ${DOCKERFILE_CSV}
                     """
                 }
             }
@@ -37,19 +50,19 @@ pipeline {
             steps {
                 script {
                     sh """
-                    # Scan Docker image and save as JSON
-                    trivy image --format json -o ${REPORT_JSON} ${IMAGE_NAME}:latest
+                    # Scan Docker image in JSON
+                    trivy image --format json -o ${IMAGE_JSON} ${IMAGE_NAME}:latest
 
-                    # Convert JSON to CSV using jq
+                    # Convert JSON → CSV using jq
                     jq -r '
-                        .Results[].Vulnerabilities[] | [
-                          .VulnerabilityID,
-                          .PkgName,
-                          .InstalledVersion,
-                          .FixedVersion,
-                          .Severity,
-                          .Title
-                        ] | @csv' ${REPORT_JSON} > ${REPORT_CSV}
+                      .Results[].Vulnerabilities[] | [
+                        .VulnerabilityID,
+                        .PkgName,
+                        .InstalledVersion,
+                        .FixedVersion,
+                        .Severity,
+                        .Title
+                      ] | @csv' ${IMAGE_JSON} > ${IMAGE_CSV}
                     """
                 }
             }
@@ -57,7 +70,7 @@ pipeline {
 
         stage('Archive Reports') {
             steps {
-                archiveArtifacts artifacts: '*.txt, *.json, *.csv', fingerprint: true
+                archiveArtifacts artifacts: '*.json, *.csv', fingerprint: true
             }
         }
     }
