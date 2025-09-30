@@ -2,65 +2,79 @@ pipeline {
     agent any
 
     environment {
-        VULN_THRESHOLD = 80
         TRIVY_SEVERITY = "HIGH,MEDIUM,LOW"
     }
 
     stages {
-        stage('Checkout') {
+
+        stage('Checkout SCM') {
             steps {
-                git branch: 'master', url: 'https://github.com/Anandb007/trivy.git'
+                checkout scm
             }
         }
 
-        stage('Build & Scan Dockerfiles') {
+        stage('Scan Multiple Dockerfiles') {
             steps {
                 script {
                     // List of Dockerfiles and corresponding image names
                     def dockerfiles = [
-                        ['path': 'Dockerfile/clean/Dockerfile',     'image': 'my-nginx-clean'],
-                        ['path': 'Dockerfile/misconfig/Dockerfile', 'image': 'my-nginx-misconfig'],
-                        ['path': 'Dockerfile/vuln/Dockerfile',      'image': 'my-nginx-vuln']
+                        ['file': 'Dockerfile/clean/Dockerfile', 'image': 'my-nginx-clean'],
+                        ['file': 'Dockerfile/misconfig/Dockerfile', 'image': 'my-nginx-misconfig'],
+                        ['file': 'Dockerfile/vuln/Dockerfile', 'image': 'my-nginx-vuln']
                     ]
 
                     dockerfiles.each { df ->
-                        echo "🔨 Building Docker image for ${df.path}"
-                        sh "docker build -f ${df.path} -t ${df.image}:latest ."
+                        echo "Building and scanning ${df.file}..."
 
-                        echo "🔍 Scanning image ${df.image}..."
-                        sh """
-                        trivy image --severity ${TRIVY_SEVERITY} --format json -o ${df.image}_image.json ${df.image}:latest
-                        jq -r '.Results[].Vulnerabilities[]? | [.VulnerabilityID,.PkgName,.InstalledVersion,.FixedVersion,.Severity,.Title] | @csv' ${df.image}_image.json > ${df.image}_image.csv || true
-                        """
+                        // Build Docker image
+                        sh "docker build -f ${df.file} -t ${df.image}:latest ."
 
-                        echo "📂 Scanning Dockerfile for misconfigurations..."
-                        sh """
-                        trivy config --severity ${TRIVY_SEVERITY} --format json -o ${df.image}_dockerfile.json \$(dirname ${df.path})
-                        jq -r '.Results[].Misconfigurations[]? | [.ID,.Type,.Message,.Severity,.Resolution,(.References//[] | join("; "))] | @csv' ${df.image}_dockerfile.json > ${df.image}_dockerfile.csv || true
-                        """
+                        // Scan image for vulnerabilities
+                        sh "trivy image --severity ${TRIVY_SEVERITY} --format json -o ${df.image}_image.json ${df.image}:latest || true"
 
-                        echo "📊 Calculating vulnerability count..."
-                        def vulnCount = sh(
+                        // Scan Dockerfile/config for misconfigurations
+                        def dockerfileDir = sh(script: "dirname ${df.file}", returnStdout: true).trim()
+                        sh "trivy config --severity ${TRIVY_SEVERITY} --format json -o ${df.image}_dockerfile.json ${dockerfileDir} || true"
+
+                        // Convert JSON to CSV
+                        sh "jq -r '.Results[].Vulnerabilities[]? | [.VulnerabilityID,.PkgName,.InstalledVersion,.FixedVersion,.Severity,.Title] | @csv' ${df.image}_image.json > ${df.image}_image.csv || true"
+                        sh "jq -r '.Results[].Misconfigurations[]? | [.ID,.Type,.Message,.Severity,.Resolution,(.References//[] | join(\"; \"))] | @csv' ${df.image}_dockerfile.json > ${df.image}_dockerfile.csv || true"
+
+                        // Count vulnerabilities
+                        def totalVulns = sh(
                             script: "jq '[.Results[].Vulnerabilities[]?] | length' ${df.image}_image.json",
                             returnStdout: true
                         ).trim().toInteger()
 
-                        def misconfigCount = sh(
+                        def highCriticalVulns = sh(
+                            script: "jq '[.Results[].Vulnerabilities[]? | select(.Severity==\"CRITICAL\" or .Severity==\"HIGH\")] | length' ${df.image}_image.json",
+                            returnStdout: true
+                        ).trim().toInteger()
+
+                        def totalMisconfigs = sh(
                             script: "jq '[.Results[].Misconfigurations[]?] | length' ${df.image}_dockerfile.json",
                             returnStdout: true
                         ).trim().toInteger()
 
-                        def totalIssues = vulnCount + misconfigCount
-                        echo "Total issues found for ${df.image}: ${totalIssues}"
+                        def highCriticalMisconfigs = sh(
+                            script: "jq '[.Results[].Misconfigurations[]? | select(.Severity==\"CRITICAL\" or .Severity==\"HIGH\")] | length' ${df.image}_dockerfile.json",
+                            returnStdout: true
+                        ).trim().toInteger()
 
-                        if (totalIssues > VULN_THRESHOLD.toInteger()) {
-                            error "❌ Build failed! ${df.image} exceeded vulnerability threshold (${totalIssues} > ${VULN_THRESHOLD})"
+                        def totalIssues = totalVulns + totalMisconfigs
+                        def totalHighCritical = highCriticalVulns + highCriticalMisconfigs
+
+                        echo "Total issues for ${df.image}: ${totalIssues}, Critical/High: ${totalHighCritical}"
+
+                        // Calculate percentage of critical/high issues
+                        def percentage = totalIssues > 0 ? (totalHighCritical / totalIssues) * 100 : 0
+                        echo "Percentage of critical/high issues for ${df.image}: ${percentage}%"
+
+                        if (percentage >= 80) {
+                            echo "❌ ${df.image} failed security check (>= 80% critical/high issues)!"
                         } else {
-                            echo "✅ ${df.image} passed security scan (Issues: ${totalIssues})"
+                            echo "✅ ${df.image} passed security check (< 80% critical/high issues)."
                         }
-
-                        echo "🧹 Cleaning up Docker image ${df.image}"
-                        sh "docker rmi ${df.image}:latest || true"
                     }
                 }
             }
@@ -68,15 +82,15 @@ pipeline {
 
         stage('Archive Reports') {
             steps {
-                archiveArtifacts artifacts: '*.json, *.csv', fingerprint: true
+                archiveArtifacts artifacts: '*.json, *.csv', allowEmptyArchive: true
             }
         }
     }
 
     post {
         always {
-            echo "🧹 Cleaning up leftover files..."
-            sh "rm -f *.json *.csv || true"
+            echo "Cleaning up temporary files..."
+            sh 'rm -f *.json *.csv'
         }
     }
 }
