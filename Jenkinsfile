@@ -2,87 +2,77 @@ pipeline {
     agent any
 
     environment {
-        TRIVY_SEVERITY = "HIGH,MEDIUM,LOW"
+        REGISTRY = "my-docker-registry"   // change if pushing images
     }
 
     stages {
-
-        stage('Checkout SCM') {
+        stage('Build & Scan Docker Images') {
             steps {
-                checkout scm
+                script {
+                    // Define Dockerfiles and their image tags
+                    def dockerfiles = [
+                        [path: 'Dockerfile/clean/Dockerfile.clean', image: 'my-nginx-clean'],
+                        [path: 'Dockerfile/misconfig/Dockerfile.misconfig', image: 'my-nginx-misconfig'],
+                        [path: 'Dockerfile/vuln/Dockerfile.vuln', image: 'my-nginx-vuln']
+                    ]
+
+                    def results = [:] // Store scan results
+
+                    dockerfiles.each { df ->
+                        echo "Building image for ${df.image}..."
+                        sh """
+                            docker build -f ${df.path} -t ${df.image}:latest .
+                        """
+
+                        echo "Scanning image ${df.image} with Trivy..."
+                        sh """
+                            trivy image --format json --output trivy-${df.image}.json ${df.image}:latest || true
+                            trivy image --format csv  --output trivy-${df.image}.csv  ${df.image}:latest || true
+                        """
+
+                        // Evaluate scan results (JSON parsing)
+                        def vulnSummary = sh(
+                            script: "jq -r '[.Results[].Vulnerabilities[]?.Severity] | group_by(.) | map({(.[0]): length}) | add' trivy-${df.image}.json",
+                            returnStdout: true
+                        ).trim()
+
+                        echo "Vulnerability summary for ${df.image}: ${vulnSummary}"
+
+                        def total = sh(script: "jq '[.Results[].Vulnerabilities[]?] | length' trivy-${df.image}.json", returnStdout: true).trim().toInteger()
+                        def critical = sh(script: "jq '[.Results[].Vulnerabilities[]? | select(.Severity==\"CRITICAL\")] | length' trivy-${df.image}.json", returnStdout: true).trim().toInteger()
+
+                        // Calculate "pass percentage" → 100 - (critical/total)*100
+                        def passPercent = (total > 0) ? (100 - (critical * 100 / total)) : 100
+                        echo "Pass percentage for ${df.image}: ${passPercent}%"
+
+                        // Fail only if CRITICAL or pass < 80%
+                        if (critical > 0 || passPercent < 80) {
+                            echo "❌ ${df.image} failed due to critical vulns or <80% threshold"
+                            results[df.image] = "FAIL"
+                        } else {
+                            echo "✅ ${df.image} passed scan"
+                            results[df.image] = "PASS"
+                        }
+                    }
+
+                    // Summary of all scans
+                    echo "Scan results: ${results}"
+                }
             }
         }
 
-        stage('Scan Multiple Dockerfiles') {
+        stage('Publish Trivy Reports') {
             steps {
-                script {
-                    // List of Dockerfiles and corresponding image names
-                    def dockerfiles = [
-                        ['file': 'Dockerfile/clean/Dockerfile', 'image': 'my-nginx-clean'],
-                        ['file': 'Dockerfile/misconfig/Dockerfile', 'image': 'my-nginx-misconfig'],
-                        ['file': 'Dockerfile/vuln/Dockerfile', 'image': 'my-nginx-vuln']
-                    ]
-
-                    dockerfiles.each { df ->
-                        echo "Building and scanning ${df.file}..."
-
-                        // Build Docker image
-                        sh "docker build -f ${df.file} -t ${df.image}:latest ."
-
-                        // Scan image for vulnerabilities
-                        sh "trivy image --severity ${TRIVY_SEVERITY} --format json -o ${df.image}_image.json ${df.image}:latest || true"
-
-                        // Scan Dockerfile/config for misconfigurations
-                        def dockerfileDir = sh(script: "dirname ${df.file}", returnStdout: true).trim()
-                        sh "trivy config --severity ${TRIVY_SEVERITY} --format json -o ${df.image}_dockerfile.json ${dockerfileDir} || true"
-
-                        // Convert JSON to CSV
-                        sh "jq -r '.Results[].Vulnerabilities[]? | [.VulnerabilityID,.PkgName,.InstalledVersion,.FixedVersion,.Severity,.Title] | @csv' ${df.image}_image.json > ${df.image}_image.csv || true"
-                        sh "jq -r '.Results[].Misconfigurations[]? | [.ID,.Type,.Message,.Severity,.Resolution,(.References//[] | join(\"; \"))] | @csv' ${df.image}_dockerfile.json > ${df.image}_dockerfile.csv || true"
-
-                        // Count vulnerabilities
-                        def totalVulns = sh(
-                            script: "jq '[.Results[].Vulnerabilities[]?] | length' ${df.image}_image.json",
-                            returnStdout: true
-                        ).trim().toInteger()
-
-                        def highCriticalVulns = sh(
-                            script: "jq '[.Results[].Vulnerabilities[]? | select(.Severity==\"CRITICAL\" or .Severity==\"HIGH\")] | length' ${df.image}_image.json",
-                            returnStdout: true
-                        ).trim().toInteger()
-
-                        def totalMisconfigs = sh(
-                            script: "jq '[.Results[].Misconfigurations[]?] | length' ${df.image}_dockerfile.json",
-                            returnStdout: true
-                        ).trim().toInteger()
-
-                        def highCriticalMisconfigs = sh(
-                            script: "jq '[.Results[].Misconfigurations[]? | select(.Severity==\"CRITICAL\" or .Severity==\"HIGH\")] | length' ${df.image}_dockerfile.json",
-                            returnStdout: true
-                        ).trim().toInteger()
-
-                        def totalIssues = totalVulns + totalMisconfigs
-                        def totalHighCritical = highCriticalVulns + highCriticalMisconfigs
-
-                        echo "Total issues for ${df.image}: ${totalIssues}, Critical/High: ${totalHighCritical}"
-
-                        // Calculate percentage of critical/high issues
-                        def percentage = totalIssues > 0 ? (totalHighCritical / totalIssues) * 100 : 0
-                        echo "Percentage of critical/high issues for ${df.image}: ${percentage}%"
-
-                        if (percentage >= 80) {
-                            echo "❌ ${df.image} failed security check (>= 80% critical/high issues)!"
-                        } else {
-                            echo "✅ ${df.image} passed security check (< 80% critical/high issues)."
-                        }
-                    }
-                }
+                recordIssues(
+                    tools: [csv(pattern: 'trivy-*.csv')],
+                    trendChartType: 'TOOLS_ONLY'
+                )
             }
         }
 
         stage('Archive Reports') {
             steps {
-                archiveArtifacts artifacts: '*.json, *.csv', allowEmptyArchive: true
+                archiveArtifacts artifacts: 'trivy-*.json, trivy-*.csv', allowEmptyArchive: true
             }
         }
     }
@@ -90,7 +80,7 @@ pipeline {
     post {
         always {
             echo "Cleaning up temporary files..."
-            sh 'rm -f *.json *.csv'
+            sh 'rm -f trivy-*.json trivy-*.csv || true'
         }
     }
 }
