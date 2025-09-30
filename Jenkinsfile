@@ -15,20 +15,22 @@ pipeline {
         stage('Scan Multiple Dockerfiles') {
             steps {
                 script {
-                    // List of Dockerfiles and corresponding image names
+                    // Updated Dockerfile paths
                     def dockerfiles = [
-                        ['file': 'Dockerfile.clean', 'image': 'my-nginx-clean'],
-                        ['file': 'Dockerfile.misconfig', 'image': 'my-nginx-misconfig'],
-                        ['file': 'Dockerfile.vuln', 'image': 'my-nginx-vuln']
+                        ['path': 'Dockerfile/clean/Dockerfile', 'image': 'my-nginx-clean'],
+                        ['path': 'Dockerfile/misconfig/Dockerfile', 'image': 'my-nginx-misconfig'],
+                        ['path': 'Dockerfile/vuln/Dockerfile', 'image': 'my-nginx-vuln']
                     ]
 
                     dockerfiles.each { df ->
-                        echo "Building and scanning ${df.file}..."
-                        sh "docker build -f ${df.file} -t ${df.image}:latest ."
+                        echo "Building and scanning ${df.path}..."
+
+                        // Build Docker image
+                        sh "docker build -f ${df.path} -t ${df.image}:latest ."
 
                         // Dockerfile config scan
                         sh """
-                        trivy config --severity HIGH,MEDIUM,LOW --format json -o ${df.image}_dockerfile.json -f ${df.file}
+                        trivy config --severity HIGH,MEDIUM,LOW --format json -o ${df.image}_dockerfile.json -f ${df.path}
                         jq -r '.Results[].Misconfigurations[] | [.ID,.Type,.Message,.Severity,.Resolution,(.References//[] | join("; "))] | @csv' ${df.image}_dockerfile.json > ${df.image}_dockerfile.csv
                         """
 
