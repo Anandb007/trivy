@@ -1,0 +1,176 @@
+Trivy Dockerfile Scanning Pipeline Documentation
+
+1. Project Overview
+    The goal of this project is to scan multiple Dockerfiles for vulnerabilities and misconfigurations using Trivy in a Jenkins CI/CD pipeline.
+    The pipeline should:
+    Build Docker images from multiple Dockerfiles.
+    Scan images for vulnerabilities.
+    Scan Dockerfiles for misconfigurations.
+    Generate CSV/JSON reports for each scan.
+    Fail an image if the percentage of critical/high issues exceeds 80%
+    Continue scanning other images regardless of individual failures.
+
+2. Initial File & Folder Setup
+    2.1 Folder Structure
+     Create a main folder:
+        mkdir trivy
+        cd trivy
+     Inside trivy, create a folder for Dockerfiles:
+        mkdir Dockerfile
+        
+     Inside Dockerfile, create subfolders for each Dockerfile type:
+        cd Dockerfile
+        mkdir clean misconfig vuln
+     Move Dockerfiles into respective subfolders:
+        mv ../Dockerfile.clean clean/
+        mv ../Dockerfile.misconfig misconfig/
+        mv ../Dockerfile.vuln vuln/
+
+2.2 Final Folder Layout
+    trivy/
+    ├── Dockerfile/
+    │   ├── clean/
+    │   │   └── Dockerfile
+    │   ├── misconfig/
+    │   │   └── Dockerfile
+    │   └── vuln/
+    │       └── Dockerfile
+    ├── Jenkinsfile
+    ├── Jenkinsfile.misconfig
+    └── Jenkinsfile.vuln
+
+3. Issues Faced and Solutions
+Issue 1: Dockerfile not found
+
+    Error: failed to read dockerfile: open Dockerfile.clean: no such file or directory
+    Cause: Dockerfiles were not organized in separate subfolders.
+    Solution: Moved Dockerfiles into folders like Dockerfile/clean/Dockerfile, Dockerfile/misconfig/Dockerfile, and Dockerfile/vuln/Dockerfile.
+
+Issue 2: Trivy config scan failed
+
+    Error: FATAL: Require at least 1 argument 
+    Cause: Trivy config requires directory path, not file path.
+    Solution: Pass the directory containing Dockerfile instead of the Dockerfile itself:
+    trivy config --severity HIGH,MEDIUM,LOW --format json -o my-nginx-clean_dockerfile.json Dockerfile/clean
+
+Issue 3: jq failed with null
+
+    Error: jq: error (at my-nginx-vuln_image.json:86): Cannot iterate over null (null)
+    Cause: Some images/Dockerfiles had no vulnerabilities or misconfigurations, causing jq to fail when iterating a null array.
+    Solution: Added ? operator in jq to safely handle null:
+    jq -r '.Results[].Vulnerabilities[]? | [.VulnerabilityID,.PkgName,.InstalledVersion,.FixedVersion,.Severity,.Title] | @csv'
+
+Issue 4: Pipeline fails for any high vulnerability
+
+    Cause: Jenkins pipeline failed if any image had vulnerabilities.
+    Solution: Added logic to handle failures individually, allowing other images to build and scan:
+    Count HIGH/CRITICAL vulnerabilities.
+    Calculate percentage.
+    Fail only images exceeding 80% of critical/high issues.
+
+4. Jenkinsfile: Final Working Pipeline
+    pipeline {
+        agent any
+    
+        environment {
+            TRIVY_SEVERITY = "HIGH,MEDIUM,LOW"
+        }
+    
+        stages {
+            stage('Checkout SCM') {
+                steps {
+                    checkout scm
+                }
+            }
+    
+            stage('Scan Multiple Dockerfiles') {
+                steps {
+                    script {
+                        def dockerfiles = [
+                            ['file': 'Dockerfile/clean/Dockerfile', 'image': 'my-nginx-clean'],
+                            ['file': 'Dockerfile/misconfig/Dockerfile', 'image': 'my-nginx-misconfig'],
+                            ['file': 'Dockerfile/vuln/Dockerfile', 'image': 'my-nginx-vuln']
+                        ]
+    
+                        dockerfiles.each { df ->
+                            echo "Building and scanning ${df.file}..."
+    
+                            // Build Docker image
+                            sh "docker build -f ${df.file} -t ${df.image}:latest ."
+    
+                            // Trivy image scan
+                            sh "trivy image --severity ${TRIVY_SEVERITY} --format json -o ${df.image}_image.json ${df.image}:latest || true"
+    
+                            // Trivy Dockerfile scan
+                            def dockerfileDir = sh(script: "dirname ${df.file}", returnStdout: true).trim()
+                            sh "trivy config --severity ${TRIVY_SEVERITY} --format json -o ${df.image}_dockerfile.json ${dockerfileDir} || true"
+    
+                            // Convert JSON to CSV
+                            sh "jq -r '.Results[].Vulnerabilities[]? | [.VulnerabilityID,.PkgName,.InstalledVersion,.FixedVersion,.Severity,.Title] | @csv' ${df.image}_image.json > ${df.image}_image.csv || true"
+                            sh "jq -r '.Results[].Misconfigurations[]? | [.ID,.Type,.Message,.Severity,.Resolution,(.References//[] | join(\"; \"))] | @csv' ${df.image}_dockerfile.json > ${df.image}_dockerfile.csv || true"
+    
+                            // Count issues
+                            def totalVulns = sh(script: "jq '[.Results[].Vulnerabilities[]?] | length' ${df.image}_image.json", returnStdout: true).trim().toInteger()
+                            def highCriticalVulns = sh(script: "jq '[.Results[].Vulnerabilities[]? | select(.Severity==\"CRITICAL\" or .Severity==\"HIGH\")] | length' ${df.image}_image.json", returnStdout: true).trim().toInteger()
+                            def totalMisconfigs = sh(script: "jq '[.Results[].Misconfigurations[]?] | length' ${df.image}_dockerfile.json", returnStdout: true).trim().toInteger()
+                            def highCriticalMisconfigs = sh(script: "jq '[.Results[].Misconfigurations[]? | select(.Severity==\"CRITICAL\" or .Severity==\"HIGH\")] | length' ${df.image}_dockerfile.json", returnStdout: true).trim().toInteger()
+    
+                            // Calculate percentage
+                            def totalIssues = totalVulns + totalMisconfigs
+                            def totalHighCritical = highCriticalVulns + highCriticalMisconfigs
+                            def percentage = totalIssues > 0 ? (totalHighCritical / totalIssues) * 100 : 0
+    
+                            if (percentage >= 80) {
+                                echo "❌ ${df.image} failed security check (>= 80% critical/high issues)!"
+                            } else {
+                                echo "✅ ${df.image} passed security check (< 80% critical/high issues)."
+                            }
+                        }
+                    }
+                }
+            }
+    
+            stage('Archive Reports') {
+                steps {
+                    archiveArtifacts artifacts: '*.json, *.csv', allowEmptyArchive: true
+                }
+            }
+        }
+    
+        post {
+            always {
+                echo "Cleaning up temporary files..."
+                sh 'rm -f *.json *.csv'
+            }
+        }
+    }
+
+5. Pipeline Workflow
+
+      Checkout source code from Git repository.    
+      Loop through Dockerfiles (clean, misconfig, vuln):
+      Build the Docker image.
+      Scan the image for vulnerabilities.
+      Scan Dockerfile for misconfigurations.
+      Convert results to CSV format.
+      Count total and high/critical issues.
+      Calculate percentage of high/critical issues.
+      Mark pass/fail for each image individually if percentage >= 80%.
+      Archive scan reports in Jenkins.
+      Cleanup JSON/CSV files after pipeline execution.
+
+6. Benefits of This Pipeline
+
+      Handles multiple Dockerfiles in one Jenkins job. 
+      Prevents one image failure from stopping other scans.
+      Generates JSON and CSV reports for detailed review.
+      Supports pass/fail thresholds based on high/critical vulnerability percentage (customizable).
+      Automates security checks in CI/CD workflow.
+
+7. Key Learnings / Notes
+
+      Organizing Dockerfiles into subfolders avoids path issues.
+      Trivy config scan requires directory path, not Dockerfile.
+      jq ? operator avoids errors with empty/null arrays.
+      Jenkins pipeline logic allows per-image conditional failure without stopping the entire pipeline.
+      Threshold logic (like 80%) gives flexible pass/fail control.

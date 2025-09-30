@@ -1,0 +1,311 @@
+Trivy, Docker, and Jenkins Integration on Ubuntu EC2
+
+1. Overview
+
+This document explains the complete setup and configuration for integrating Trivy (a container security scanner), Docker, and Jenkins on an Ubuntu EC2 instance. It covers:
+
+Installing required tools (Docker, Jenkins, Java, Trivy)
+
+GitHub repository integration
+
+Writing and pushing a Dockerfile
+
+Setting up Jenkins pipeline
+
+Scanning Dockerfile and Docker image for vulnerabilities
+
+Generating reports in CSV format
+
+Handling errors encountered during the setup
+
+The goal is to create a fully automated CI/CD pipeline that performs container vulnerability scanning and provides results in a structured, spreadsheet-friendly format.
+
+2. Prerequisites
+
+Before starting, ensure the following:
+
+AWS EC2 instance running Ubuntu 22.04 LTS
+
+Security group open for SSH (port 22) and Jenkins (port 8080)
+
+Basic knowledge of Linux commands, Docker, and Git
+
+3. EC2 Server Configuration
+3.1 Launch EC2 Instance
+
+Log in to AWS console and launch a Ubuntu 22.04 LTS EC2 instance.
+
+Select instance type (e.g., t2.medium) to ensure sufficient resources.
+
+Configure security groups:
+
+SSH (port 22) to access the instance
+
+HTTP (port 80) if serving Nginx
+
+Jenkins (port 8080) for web access
+
+3.2 Update System Packages
+
+Keeping the system updated is critical for security and compatibility.
+
+sudo apt update && sudo apt upgrade -y
+
+
+Explanation: Updates package lists (apt update) and upgrades installed packages (apt upgrade).
+
+This ensures we have the latest security patches before installing Docker, Jenkins, and Trivy.
+
+4. Installing Required Tools
+4.1 Java 17
+
+Jenkins requires Java to run.
+
+sudo apt install openjdk-17-jdk -y
+java -version
+
+
+Explanation:
+
+Installs OpenJDK 17, which is compatible with the latest Jenkins versions.
+
+Verifying with java -version ensures Java is correctly installed.
+
+4.2 Git
+
+Git is required to pull the repository and integrate with Jenkins.
+
+sudo apt install git -y
+git --version
+
+
+Ensures version control capabilities for source code and pipeline scripts.
+
+4.3 Docker
+
+Docker is required to build and manage container images.
+
+sudo apt install docker.io -y
+sudo systemctl start docker
+sudo systemctl enable docker
+
+
+Explanation:
+
+Installs Docker engine.
+
+systemctl start runs Docker immediately.
+
+systemctl enable ensures Docker starts on reboot.
+
+Common Error:
+
+permission denied while trying to connect to the Docker daemon socket
+
+
+Solution:
+
+Jenkins runs under its own user. Add Jenkins to the Docker group:
+
+sudo usermod -aG docker jenkins
+sudo systemctl restart jenkins
+
+4.4 Trivy
+
+Trivy is used for scanning Dockerfiles and Docker images for vulnerabilities.
+
+wget https://github.com/aquasecurity/trivy/releases/latest/download/trivy_0.66.0_Linux-64bit.deb
+sudo dpkg -i trivy_0.66.0_Linux-64bit.deb
+trivy --version
+
+
+Common Errors & Solutions:
+
+404 Not Found
+
+Occurs if using an old version URL.
+
+Solution: Always use the latest release URL from Trivy GitHub.
+
+4.5 Jenkins
+wget -q -O - https://pkg.jenkins.io/debian/jenkins.io.key | sudo apt-key add -
+sudo sh -c 'echo deb https://pkg.jenkins.io/debian binary/ > /etc/apt/sources.list.d/jenkins.list'
+sudo apt update
+sudo apt install jenkins -y
+sudo systemctl start jenkins
+sudo systemctl enable jenkins
+
+
+Common Error:
+
+GPG error: NO_PUBKEY
+
+
+Solution:
+
+Ensure the public key is added correctly.
+
+Use the command shown above to import the key.
+
+5. GitHub Integration
+
+Clone the repository:
+
+git clone -b master https://github.com/Anandb007/trivy.git
+cd trivy
+
+
+Add GitHub token in Jenkins credentials if the repo is private.
+
+Common Git Error:
+
+git pull: divergent branches
+
+
+Solution:
+
+git pull --no-rebase
+# Or globally
+git config --global pull.rebase false
+
+6. Dockerfile Creation
+FROM nginx:latest
+EXPOSE 80
+
+
+Simple Nginx image with exposed port 80.
+
+No index.html included — handled separately in deployment if needed.
+
+7. Jenkins Pipeline Configuration
+7.1 Create Pipeline Job
+
+Type: Pipeline
+
+Script from SCM: Git repository
+
+Branch: master
+
+Webhook: GitHub push triggers build
+
+7.2 Jenkinsfile
+pipeline {
+    agent any
+
+    environment {
+        IMAGE_NAME = "my-nginx"
+        DOCKERFILE_JSON = "dockerfile_scan.json"
+        DOCKERFILE_CSV = "dockerfile_scan.csv"
+        IMAGE_JSON = "trivy_report.json"
+        IMAGE_CSV = "trivy_report.csv"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'master', url: 'https://github.com/Anandb007/trivy.git'
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    sh "docker build -t ${IMAGE_NAME}:latest ."
+                }
+            }
+        }
+
+        stage('Trivy Scan Dockerfile') {
+            steps {
+                script {
+                    sh """
+                    trivy config --severity HIGH,MEDIUM,LOW --format json -o ${DOCKERFILE_JSON} .
+                    jq -r '
+                      .Results[].Misconfigurations[] | [
+                        .ID,
+                        .Type,
+                        .Message,
+                        .Severity,
+                        .Resolution,
+                        (.References // [] | join("; "))
+                      ] | @csv' ${DOCKERFILE_JSON} > ${DOCKERFILE_CSV}
+                    """
+                }
+            }
+        }
+
+        stage('Trivy Scan Docker Image') {
+            steps {
+                script {
+                    sh """
+                    trivy image --format json -o ${IMAGE_JSON} ${IMAGE_NAME}:latest
+                    jq -r '
+                      .Results[].Vulnerabilities[] | [
+                        .VulnerabilityID,
+                        .PkgName,
+                        .InstalledVersion,
+                        .FixedVersion,
+                        .Severity,
+                        .Title
+                      ] | @csv' ${IMAGE_JSON} > ${IMAGE_CSV}
+                    """
+                }
+            }
+        }
+
+        stage('Archive Reports') {
+            steps {
+                archiveArtifacts artifacts: '*.json, *.csv', fingerprint: true
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Cleaning up Docker image..."
+            sh "docker rmi ${IMAGE_NAME}:latest || true"
+        }
+    }
+}
+
+8. Trivy Output Explanation
+8.1 Dockerfile Scan
+
+Generates JSON → converted to CSV.
+
+Columns: ID, Type, Message, Severity, Resolution, References.
+
+Captures misconfigurations, e.g., running containers as root.
+
+8.2 Docker Image Scan
+
+Generates JSON → converted to CSV.
+
+Columns: VulnerabilityID, PkgName, InstalledVersion, FixedVersion, Severity, Title.
+
+Includes all vulnerabilities (LOW, MEDIUM, HIGH, CRITICAL).
+
+Errors Previously Faced:
+
+Old Trivy versions supported --format csv, new versions require JSON + jq conversion.
+
+Table output caused â”€ characters in reports; resolved using JSON → CSV conversion.
+
+9. Common Issues & Solutions
+Issue	Cause	Solution
+Docker permission denied	Jenkins user not in Docker group	sudo usermod -aG docker jenkins
+Trivy CSV format removed	Using latest Trivy version	Convert JSON → CSV using jq
+Jenkins table output in CSV	Table output default	Use JSON + jq
+Git divergent branches	Local & remote diverged	git pull --no-rebase
+Jenkins GPG error	Missing key	Add Jenkins public key
+10. Conclusion
+
+This setup provides:
+
+Automated build of Docker images
+
+Scanning Dockerfile & images with Trivy
+
+Generating CSV reports readable in Excel/Sheets
+
+Jenkins CI/CD pipeline integrated with GitHub
