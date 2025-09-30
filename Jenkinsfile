@@ -30,10 +30,9 @@ pipeline {
 
                         // Dockerfile config scan
                         sh """
-                        trivy config --severity HIGH,MEDIUM,LOW --format json -o ${df.image}_dockerfile.json -f ${df.path}
-                        jq -r '.Results[].Misconfigurations[] | [.ID,.Type,.Message,.Severity,.Resolution,(.References//[] | join("; "))] | @csv' ${df.image}_dockerfile.json > ${df.image}_dockerfile.csv
+                        trivy config --severity HIGH,MEDIUM,LOW --format json -o ${df.image}_dockerfile.json $(dirname ${df.path})
+jq -r '.Results[].Misconfigurations[] | [.ID,.Type,.Message,.Severity,.Resolution,(.References//[] | join("; "))] | @csv' ${df.image}_dockerfile.json > ${df.image}_dockerfile.csv
                         """
-
                         // Docker image scan
                         sh """
                         trivy image --severity HIGH,MEDIUM,LOW --format json -o ${df.image}_image.json ${df.image}:latest
